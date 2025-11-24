@@ -4,7 +4,7 @@
   "description": "A starter application for the NTU CI/CD workshop.",
   "main": "server.js",
   "scripts": {
-    "start": "node app.js",
+    "start": "node server.js",
     "test": "jest"
   },
   "keywords": [
