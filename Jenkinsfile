@@ -1,86 +1,115 @@
 pipeline {
     agent any
     
-    tools {
-        nodejs 'NodeJS-24-LTS'
-    }
-    
     environment {
-        APP_NAME = 'staging-app'
-        APP_PORT = '8081'
-        CONTAINER_PORT = '3000'
+        DOCKER_HUB_REPO = 'ryukyucoding/myapp'
+        DISCORD_WEBHOOK = credentials('discord-webhook-url')
     }
     
     stages {
-        stage('Checkout SCM') {
-            steps {
-                checkout scm
-            }
-        }
-        
-        stage('Install Dependencies') {
-            steps {
-                sh 'npm install'
-            }
-        }
-        
-        stage('Run Tests') {
-            steps {
-                sh 'npm test'
-            }
-        }
-        
-        stage('Build Docker Image') {
+        stage('Static Analysis') {
             steps {
                 script {
-                    echo "Building Docker image: ${APP_NAME}:${BUILD_NUMBER}"
-                    sh "docker build -t ${APP_NAME}:${BUILD_NUMBER} ."
-                    sh "docker tag ${APP_NAME}:${BUILD_NUMBER} ${APP_NAME}:latest"
+                    echo "Running ESLint..."
+                    sh 'npm install'
+                    sh 'npm run lint'
                 }
             }
         }
         
-        stage('Deploy and Verify') {
+        stage('Build & Deploy - Dev') {
+            when {
+                branch 'dev'
+            }
             steps {
                 script {
-                    echo "Stopping old container if exists..."
-                    sh "docker stop ${APP_NAME} || true"
-                    sh "docker rm ${APP_NAME} || true"
+                    def imageTag = "dev-${env.BUILD_NUMBER}"
                     
-                    echo "Starting new container..."
-                    sh """
-                        docker run -d \
-                        --name ${APP_NAME} \
-                        -p ${APP_PORT}:${CONTAINER_PORT} \
-                        ${APP_NAME}:latest
-                    """
+                    // Build Docker image
+                    sh "docker build -t ${DOCKER_HUB_REPO}:${imageTag} ."
                     
-                    echo "Waiting for application to start..."
-                    sleep 10
+                    // Push to Docker Hub
+                    withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', 
+                                                      usernameVariable: 'DOCKER_USER', 
+                                                      passwordVariable: 'DOCKER_PASS')]) {
+                        sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
+                        sh "docker push ${DOCKER_HUB_REPO}:${imageTag}"
+                    }
                     
-                    echo "Performing health check..."
-                    sh "curl -f http://localhost:${APP_PORT}/health || exit 1"
+                    // Cleanup old container and image (force remove if exists)
+                    sh '''
+                        docker rm -f dev-app || true
+                        docker stop dev-app || true
+                    '''
                     
-                    echo "Deployment successful!"
+                    // Deploy to port 8081
+                    sh "docker run -d --name dev-app -p 8081:3000 ${DOCKER_HUB_REPO}:${imageTag}"
+                    
+                    // Health check
+                    sleep(time: 5, unit: 'SECONDS')
+                    sh 'curl -f http://localhost:8081/health || exit 1'
+                }
+            }
+        }
+        
+        stage('GitOps Promotion - Prod') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    // Read target tag from config
+                    def targetTag = readFile('deploy.config').trim()
+                    def prodTag = "prod-${env.BUILD_NUMBER}"
+                    
+                    // Pull, retag, and push
+                    withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', 
+                                                      usernameVariable: 'DOCKER_USER', 
+                                                      passwordVariable: 'DOCKER_PASS')]) {
+                        sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin"
+                        sh "docker pull ${DOCKER_HUB_REPO}:${targetTag}"
+                        sh "docker tag ${DOCKER_HUB_REPO}:${targetTag} ${DOCKER_HUB_REPO}:${prodTag}"
+                        sh "docker push ${DOCKER_HUB_REPO}:${prodTag}"
+                    }
+                    
+                    // Cleanup old container (force remove if exists)
+                    sh '''
+                        docker rm -f prod-app || true
+                        docker stop prod-app || true
+                    '''
+                    
+                    // Deploy to production
+                    sh "docker run -d --name prod-app -p 8082:3000 ${DOCKER_HUB_REPO}:${prodTag}"
+                    
+                    // Health check
+                    sleep(time: 5, unit: 'SECONDS')
+                    sh 'curl -f http://localhost:8082/health || exit 1'
                 }
             }
         }
     }
     
     post {
-        success {
-            echo '✅ Pipeline completed successfully!'
-            echo "Application is running at http://localhost:${APP_PORT}"
-        }
         failure {
-            echo '❌ Pipeline failed!'
-            sh "docker logs ${APP_NAME} || true"
-        }
-        always {
-            echo 'Cleaning up old Docker images...'
-            sh """
-                docker image prune -f
-            """
+            script {
+                def message = """
+                ❌ **Build Failed**
+                **Name:** Yu Chen
+                **Student ID:** Your Student ID
+                **Job:** ${env.JOB_NAME}
+                **Build:** #${env.BUILD_NUMBER}
+                **Repo:** ${env.GIT_URL}
+                **Branch:** ${env.BRANCH_NAME}
+                **Status:** ${currentBuild.currentResult}
+              """
+                
+                sh """
+                curl -H "Content-Type: application/json" \
+                -X POST \
+                -d '{"content": "${message}"}' \
+                ${DISCORD_WEBHOOK}
+                """
+            }
         }
     }
 }
